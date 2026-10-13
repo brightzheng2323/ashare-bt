@@ -85,26 +85,39 @@ def _index_to_one(values: Sequence[float]) -> list[float]:
 
 def plot_result(
     result: BacktestResult,
-    series: Series,
+    series: Series | None = None,
     benchmarks: Mapping[str, Sequence[float]] | None = None,
     out_path: Path | str = "output/result.png",
     title: str | None = None,
 ) -> Path:
-    """画三张图：权益对比 / 回撤 / 价格与买卖点。"""
+    """画权益对比 / 回撤 / 价格与买卖点。
+
+    `series` 传 None 就只画前两张（组合回测没有单一的"价格"可画）。
+    """
     _setup_style()
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     dates = [date.fromisoformat(d.isoformat()) for d in result.dates]
-    # 价格序列按回测日期轴对齐，停牌日沿用上一个有效价
-    closes: list[float] = []
-    for d in result.dates:
-        idx = series.index_of(d)
-        closes.append(series.bars[idx].close if idx is not None else (closes[-1] if closes else 0.0))
 
-    fig, (ax1, ax2, ax3) = plt.subplots(
-        3, 1, figsize=(12, 9), sharex=True, height_ratios=[2.2, 1.0, 1.6]
-    )
+    closes: list[float] = []
+    if series is not None:
+        # 价格序列按回测日期轴对齐，停牌日沿用上一个有效价
+        for d in result.dates:
+            idx = series.index_of(d)
+            closes.append(
+                series.bars[idx].close if idx is not None else (closes[-1] if closes else 0.0)
+            )
+
+    if series is None:
+        fig, (ax1, ax2) = plt.subplots(
+            2, 1, figsize=(12, 7), sharex=True, height_ratios=[2.2, 1.0]
+        )
+        ax3 = None
+    else:
+        fig, (ax1, ax2, ax3) = plt.subplots(
+            3, 1, figsize=(12, 9), sharex=True, height_ratios=[2.2, 1.0, 1.6]
+        )
     fig.subplots_adjust(hspace=0.12, top=0.92, bottom=0.07, left=0.07, right=0.93)
 
     # ── 子图 1：权益曲线（起点 = 1）──────────────────────────────
@@ -151,55 +164,62 @@ def plot_result(
     ax2.yaxis.set_major_formatter(FuncFormatter(lambda v, _: "0%" if abs(v) < 0.5 else f"{v:.0f}%"))
     _recessive_axes(ax2)
 
-    # ── 子图 3：价格与买卖点 ────────────────────────────────────
-    ax3.plot(dates, closes, linewidth=1.0, color=INK_MUTED, label="收盘价")
+    # ── 子图 3（可选）：价格与买卖点 ─────────────────────────────
+    if ax3 is not None:
+        ax3.plot(dates, closes, linewidth=1.0, color=INK_MUTED, label="收盘价")
 
-    fills = [f for f in result.fills if date.fromisoformat(f.date.isoformat()) in set(dates)]
-    date_index = {d: i for i, d in enumerate(dates)}
-    for side, marker, color, name in (
-        (Side.BUY, "^", STATUS_GOOD, "买入"),
-        (Side.SELL, "v", STATUS_CRITICAL, "卖出"),
-    ):
-        xs = [date.fromisoformat(f.date.isoformat()) for f in fills if f.side is side]
-        ys = [closes[date_index[date.fromisoformat(f.date.isoformat())]] for f in fills if f.side is side]
-        if xs:
+        fill_dates = set(dates)
+        fills = [f for f in result.fills if date.fromisoformat(f.date.isoformat()) in fill_dates]
+        date_index = {d: i for i, d in enumerate(dates)}
+        for side, marker, color, name in (
+            (Side.BUY, "^", STATUS_GOOD, "买入"),
+            (Side.SELL, "v", STATUS_CRITICAL, "卖出"),
+        ):
+            xs = [date.fromisoformat(f.date.isoformat()) for f in fills if f.side is side]
+            ys = [
+                closes[date_index[date.fromisoformat(f.date.isoformat())]]
+                for f in fills
+                if f.side is side
+            ]
+            if xs:
+                ax3.plot(
+                    xs,
+                    ys,
+                    linestyle="none",
+                    marker=marker,
+                    markersize=7,
+                    color=color,
+                    markeredgecolor=SURFACE,
+                    markeredgewidth=1.0,
+                    label=name,
+                    zorder=5,
+                )
+
+        rejected = [r for r in result.rejections if date.fromisoformat(r.date.isoformat()) in date_index]
+        if rejected:
+            xs = [date.fromisoformat(r.date.isoformat()) for r in rejected]
+            ys = [closes[date_index[date.fromisoformat(r.date.isoformat())]] for r in rejected]
             ax3.plot(
                 xs,
                 ys,
                 linestyle="none",
-                marker=marker,
-                markersize=7,
-                color=color,
-                markeredgecolor=SURFACE,
-                markeredgewidth=1.0,
-                label=name,
-                zorder=5,
+                marker="o",
+                markersize=8,
+                markerfacecolor="none",
+                markeredgecolor=STATUS_WARNING,
+                markeredgewidth=1.6,
+                label="被拒（涨跌停/T+1）",
+                zorder=4,
             )
 
-    rejected = [r for r in result.rejections if date.fromisoformat(r.date.isoformat()) in date_index]
-    if rejected:
-        xs = [date.fromisoformat(r.date.isoformat()) for r in rejected]
-        ys = [closes[date_index[date.fromisoformat(r.date.isoformat())]] for r in rejected]
-        ax3.plot(
-            xs,
-            ys,
-            linestyle="none",
-            marker="o",
-            markersize=8,
-            markerfacecolor="none",
-            markeredgecolor=STATUS_WARNING,
-            markeredgewidth=1.6,
-            label="被拒（涨跌停/T+1）",
-            zorder=4,
-        )
+        ax3.set_ylabel("价格", fontsize=9)
+        ax3.legend(loc="upper left", fontsize=8.5, ncol=4, labelcolor=INK_SECONDARY)
+        _recessive_axes(ax3)
 
-    ax3.set_ylabel("价格（前复权）", fontsize=9)
-    ax3.legend(loc="upper left", fontsize=8.5, ncol=4, labelcolor=INK_SECONDARY)
-    _recessive_axes(ax3)
-
-    ax3.xaxis.set_major_locator(mdates.AutoDateLocator())
-    ax3.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-    for label in ax3.get_xticklabels():
+    last_axis = ax3 if ax3 is not None else ax2
+    last_axis.xaxis.set_major_locator(mdates.AutoDateLocator())
+    last_axis.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    for label in last_axis.get_xticklabels():
         label.set_rotation(0)
 
     fig.savefig(out_path, dpi=150)

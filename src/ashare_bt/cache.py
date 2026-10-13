@@ -180,6 +180,7 @@ def rescale(series: Series, factor: float) -> Series:
 def get_backtest_series(
     code: str,
     start: date | None = None,
+    anchor: str = "start",
     cache_dir: Path = DEFAULT_CACHE_DIR,
     refresh: bool = False,
 ) -> Series:
@@ -190,18 +191,31 @@ def get_backtest_series(
     1. **用后复权**（fqt=2）。前复权对高分红股票会把价格算成 0 甚至负数，
        实测工商银行 2014 年还有 "价格 0.04 元" —— 那种数据不是失真，是没有意义。
 
-    2. **整体缩放**，让回测起点的价格等于那天的**真实成交价**。
+    2. **整体缩放**，让锚点那天的价格等于**真实成交价**。
        后复权的代价是绝对价位被放大（平安银行现在显示 1345 元，真实约 11 元），
        而价位决定了"10 万本金能买几手"。整手取整和 5 元最低佣金都按成交金额
        起作用，价位错了这两件事就全错。
+
+    Args:
+        anchor: 缩放锚点。
+            `"start"`（默认）锚在回测起点 —— 回测用这个，因为手数和费用
+            是在起点附近决定的。
+            `"end"` 锚在最后一根 K 线 —— 探索/看盘用这个，因为你想看到的是
+            "现在这只股票多少钱"，而不是三十年前的价格是真的。
 
     缩放需要真实价格，所以要额外拉一次不复权数据（会走缓存，很便宜）。
     拉不到就退回未缩放的序列 —— 收益率仍然正确，只是手数会失真。
     """
     adjusted = get_series(code, fqt=FQT_BACKWARD, cache_dir=cache_dir, refresh=refresh)
 
-    probe = start or adjusted.first_date
-    idx = adjusted.index_or_after(probe)
+    if anchor not in ("start", "end"):
+        raise ValueError(f"anchor 只能是 'start' 或 'end'，收到 {anchor!r}")
+
+    if anchor == "end":
+        idx = len(adjusted.bars) - 1
+    else:
+        probe = start or adjusted.first_date
+        idx = adjusted.index_or_after(probe)
     if idx is None:
         return adjusted
 

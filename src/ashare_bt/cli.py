@@ -22,11 +22,14 @@ from typing import Any, Sequence
 from .cache import get_backtest_series, get_series
 from .engine import EngineConfig, run_backtest
 from .errors import DataError
+from .explore import explore
 from .fetch import DEFAULT_FQT, FQT_BACKWARD, FQT_LABEL
 from .fees import DEFAULT_FEES, FeeConfig
 from .models import Series
 from .metrics import buy_and_hold, format_report, summarize
+from .optimize import format_sweep, sweep
 from .plot import plot_result
+from .portfolio import run_portfolio
 from .strategies import build, describe_all
 
 # 沪深300。必须写 "1." 前缀 —— 指数代码和个股代码会撞车，不带前缀会被当成深市个股
@@ -40,7 +43,7 @@ EXIT_USER_ERROR = 2
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
-    if args and args[0] in {"fetch", "inspect", "list-strategies"}:
+    if args and args[0] in _SUBCOMMANDS:
         return _SUBCOMMANDS[args[0]](args[1:])
     return cmd_backtest(args)
 
@@ -122,6 +125,29 @@ def cmd_list_strategies(argv: Sequence[str]) -> int:  # noqa: ARG001
     print("\n策略参数直接跟在命令后面，例如：")
     print("  backtest --code 600519 --strategy ma_cross --fast 10 --slow 30")
     return EXIT_OK
+
+
+def _codes(text: str) -> list[str]:
+    codes = [c.strip() for c in text.split(",") if c.strip()]
+    if not codes:
+        raise SystemExit("❌ --codes 至少要给一只股票")
+    return codes
+
+
+def _grid_from_extra(extra: Sequence[str]) -> dict[str, list[Any]]:
+    """把 --fast 3,5,10 --slow 20,60 收成参数网格。"""
+    grid: dict[str, list[Any]] = {}
+    i = 0
+    while i < len(extra):
+        token = extra[i]
+        if not token.startswith("--"):
+            raise SystemExit(f"❌ 看不懂的参数: {token!r}")
+        key = token[2:].replace("-", "_")
+        if i + 1 >= len(extra):
+            raise SystemExit(f"❌ {token} 后面要跟取值，比如 {token} 3,5,10")
+        grid[key] = [_coerce(v.strip()) for v in extra[i + 1].split(",") if v.strip()]
+        i += 2
+    return grid
 
 
 def _code_parser(prog: str, desc: str) -> argparse.ArgumentParser:
@@ -356,7 +382,245 @@ def cmd_backtest(argv: Sequence[str]) -> int:
     return EXIT_OK
 
 
+def cmd_explore(argv: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="backtest explore", description="把一只股票的各项数据摊开看（不做回测）"
+    )
+    parser.add_argument("--code", "-c", required=True, help="股票代码")
+    parser.add_argument("--as-of", help="截止日期 YYYY-MM-DD，默认最新一根 K 线")
+    parser.add_argument("--recent", type=int, default=10, help="显示最近多少个交易日")
+    parser.add_argument("--refresh", action="store_true")
+    parser.add_argument("--cache-dir", default="data/cache")
+    args = parser.parse_args(list(argv))
+
+    try:
+        series = get_backtest_series(
+            args.code, anchor="end", cache_dir=Path(args.cache_dir), refresh=args.refresh
+        )
+        print(explore(series, as_of=_parse_date(args.as_of, "--as-of"), recent=args.recent))
+    except DataError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return EXIT_USER_ERROR
+    except ValueError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return EXIT_USER_ERROR
+    return EXIT_OK
+
+
+def cmd_optimize(argv: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="backtest optimize",
+        description="参数寻优：用前一段找参数，用后一段检验过拟合",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "示例：\n"
+            "  backtest optimize --code 000001 --strategy ma_cross --fast 3,5,10,20 --slow 20,60,120\n"
+            "  backtest optimize --code 000001 --strategy rsi --period 6,14,24 --buy-below 20,30,40\n"
+        ),
+    )
+    parser.add_argument("--code", "-c", required=True)
+    parser.add_argument("--strategy", "-s", required=True)
+    parser.add_argument("--start")
+    parser.add_argument("--end")
+    parser.add_argument("--cash", type=float, default=100_000.0)
+    parser.add_argument("--split", type=float, default=0.7, help="样本内占比，默认 0.7")
+    parser.add_argument("--top", type=int, default=15, help="表格里显示前几名")
+    parser.add_argument("--fqt", type=int, default=DEFAULT_FQT, choices=[0, 1, 2])
+    parser.add_argument("--commission", type=float, default=DEFAULT_FEES.commission_rate)
+    parser.add_argument("--commission-min", type=float, default=DEFAULT_FEES.commission_min)
+    parser.add_argument("--stamp-duty", type=float, default=DEFAULT_FEES.stamp_duty_rate)
+    parser.add_argument("--transfer-fee", type=float, default=DEFAULT_FEES.transfer_fee_rate)
+    parser.add_argument("--refresh", action="store_true")
+    parser.add_argument("--no-rescale", action="store_true")
+    parser.add_argument("--cache-dir", default="data/cache")
+    parser.add_argument("--json", action="store_true")
+    args, extra = parser.parse_known_args(list(argv))
+
+    grid = _grid_from_extra(extra)
+    if not grid:
+        raise SystemExit("❌ 至少要给一个要扫的参数，比如 --fast 3,5,10")
+
+    start = _parse_date(args.start, "--start")
+    end = _parse_date(args.end, "--end")
+
+    try:
+        series = _load_series(args.code, args, start)
+        config = EngineConfig(initial_cash=args.cash, fees=_fee_config(args))
+        rows = sweep(
+            series,
+            args.strategy,
+            grid,
+            config=config,
+            start=start,
+            end=end,
+            split=args.split,
+            on_progress=(
+                None
+                if args.json
+                else lambda i, n, p: print(f"\r  扫参数 {i}/{n} ...", end="", file=sys.stderr)
+            ),
+        )
+    except (DataError, ValueError) as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return EXIT_USER_ERROR
+
+    if not args.json:
+        print("\r" + " " * 40 + "\r", end="", file=sys.stderr)
+        print(format_sweep(rows, args.split, top_n=args.top))
+    else:
+        print(
+            json.dumps(
+                [
+                    {
+                        "params": r.params,
+                        "in_sample": r.in_sample,
+                        "out_of_sample": r.out_of_sample,
+                    }
+                    for r in rows
+                ],
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
+        )
+    return EXIT_OK
+
+
+def cmd_portfolio(argv: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="backtest portfolio",
+        description="多股票组合（等权拆成 N 个独立子账户，子账户之间不再平衡）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "示例：\n"
+            "  backtest portfolio --codes 000001,600519,601398 --strategy ma_cross --cash 300000\n"
+            "  backtest portfolio --codes 000001,600519 --weights 0.7,0.3\n"
+        ),
+    )
+    parser.add_argument("--codes", required=True, help="逗号分隔的股票代码")
+    parser.add_argument("--weights", help="逗号分隔的权重，默认等权")
+    parser.add_argument("--strategy", "-s", default="ma_cross")
+    parser.add_argument("--start")
+    parser.add_argument("--end")
+    parser.add_argument("--cash", type=float, default=100_000.0, help="组合总本金")
+    parser.add_argument("--fqt", type=int, default=DEFAULT_FQT, choices=[0, 1, 2])
+    parser.add_argument("--commission", type=float, default=DEFAULT_FEES.commission_rate)
+    parser.add_argument("--commission-min", type=float, default=DEFAULT_FEES.commission_min)
+    parser.add_argument("--stamp-duty", type=float, default=DEFAULT_FEES.stamp_duty_rate)
+    parser.add_argument("--transfer-fee", type=float, default=DEFAULT_FEES.transfer_fee_rate)
+    parser.add_argument("--slippage-bps", type=float, default=0.0)
+    parser.add_argument("--no-benchmark", action="store_true")
+    parser.add_argument("--refresh", action="store_true")
+    parser.add_argument("--no-rescale", action="store_true")
+    parser.add_argument("--cache-dir", default="data/cache")
+    parser.add_argument("--outdir", default="output")
+    parser.add_argument("--no-plot", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    args, extra = parser.parse_known_args(list(argv))
+
+    codes = _codes(args.codes)
+    try:
+        params = _extra_params(extra)
+        build(args.strategy, **params)  # 提前校验参数名，别等跑完才发现拼错
+    except ValueError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return EXIT_USER_ERROR
+
+    weights = [float(w) for w in args.weights.split(",")] if args.weights else None
+    start = _parse_date(args.start, "--start")
+    end = _parse_date(args.end, "--end")
+    cache_dir = Path(args.cache_dir)
+
+    try:
+        portfolio = run_portfolio(
+            codes,
+            args.strategy,
+            params=params,
+            config=EngineConfig(
+                initial_cash=args.cash,
+                fees=_fee_config(args),
+                slippage_bps=args.slippage_bps,
+            ),
+            start=start,
+            end=end,
+            weights=weights,
+            loader=lambda code: get_backtest_series(
+                code, start=start, cache_dir=cache_dir, refresh=args.refresh
+            ),
+        )
+    except (DataError, ValueError) as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return EXIT_USER_ERROR
+
+    combined = portfolio.as_backtest_result(args.strategy)
+    benchmarks: dict[str, list[float]] = {}
+    if not args.no_benchmark:
+        try:
+            index_series = get_backtest_series(BENCHMARK_CODE, start=start, cache_dir=cache_dir)
+            curve = buy_and_hold(index_series, portfolio.dates, args.cash)
+            if any(v != args.cash for v in curve):
+                benchmarks[BENCHMARK_NAME] = curve
+        except DataError:
+            pass
+
+    stats = summarize(combined, benchmarks, fees=_fee_config(args), label=BENCHMARK_NAME)
+    stats["components"] = {
+        code: {
+            "name": portfolio.names[code],
+            "weight": portfolio.weights[code],
+            "total_return": portfolio.per_stock[code].equity[-1]
+            / max(portfolio.initial_cash * portfolio.weights[code], 1e-9)
+            - 1,
+            "trade_count": len(portfolio.per_stock[code].trades),
+        }
+        for code in codes
+    }
+
+    if args.json:
+        print(json.dumps(stats, ensure_ascii=False, indent=2, default=str))
+        return EXIT_OK
+
+    print(format_report(stats))
+
+    print("\n 各成分股（按分配到的资金单独结算）")
+    for code in codes:
+        sub = portfolio.per_stock[code]
+        base = portfolio.initial_cash * portfolio.weights[code]
+        ret = sub.equity[-1] / base - 1 if base else 0.0
+        print(
+            f"   {code} {portfolio.names[code]:<8} 权重 {portfolio.weights[code]:>5.1%}  "
+            f"分配 {base:>10,.0f}  收益 {ret:>+8.2%}  交易 {len(sub.trades):>3} 次"
+        )
+
+    stem = f"portfolio_{len(codes)}只_{args.strategy}"
+    outdir = Path(args.outdir)
+    _write_csv(
+        outdir / f"{stem}_equity.csv",
+        ["date", "equity", "cash", "position_value"],
+        [
+            [
+                portfolio.dates[i].isoformat(),
+                f"{portfolio.equity[i]:.2f}",
+                f"{portfolio.cash[i]:.2f}",
+                f"{portfolio.position_value[i]:.2f}",
+            ]
+            for i in range(len(portfolio.dates))
+        ],
+    )
+    if not args.no_plot:
+        try:
+            path = plot_result(combined, None, benchmarks, outdir / f"{stem}.png")
+            print(f"\n 图表: {path}")
+        except Exception as exc:
+            print(f"⚠️  画图失败（回测结果仍然有效）：{exc}", file=sys.stderr)
+
+    return EXIT_OK
+
+
 _SUBCOMMANDS = {
+    "explore": cmd_explore,
+    "optimize": cmd_optimize,
+    "portfolio": cmd_portfolio,
     "fetch": cmd_fetch,
     "inspect": cmd_inspect,
     "list-strategies": cmd_list_strategies,
