@@ -148,8 +148,12 @@ class ChipDistribution:
             avg: 当日平均价（用典型价格 (高+低+收)/3）
             turnover_pct: 当日换手率，百分数（接口给的原始单位）
         """
-        if not (low <= avg <= high):
+        # 一字板时 (高+低+收)/3 可能比 high 大或比 low 小最后一两位（浮点误差），
+        # 所以按容差判断，然后夹进区间。
+        tol = max(abs(high), abs(low), 1.0) * 1e-9
+        if not (low - tol <= avg <= high + tol):
             raise ValueError(f"平均价 {avg} 不在当日区间 [{low}, {high}] 内")
+        avg = min(max(avg, low), high)
 
         # 换手率可能超过 1（次新股上市初期很常见），夹到 [0, 1]
         turnover = min(max(turnover_pct / 100.0 * self.decay, 0.0), 1.0)

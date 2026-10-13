@@ -18,9 +18,9 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from .errors import DataError
-from .fetch import DEFAULT_FQT, fetch_series
+from .fetch import DEFAULT_FQT, FQT_BACKWARD, FQT_NONE, fetch_series
 from .models import Bar, Series
-from .rules import normalize_code, to_secid
+from .rules import to_secid
 
 DEFAULT_CACHE_DIR = Path("data/cache")
 
@@ -150,3 +150,75 @@ def get_series(
     series = fetch_series(code, fqt=fqt)
     save(series, cache_dir)
     return series
+
+
+def rescale(series: Series, factor: float) -> Series:
+    """把整条价格序列除以一个常数。
+
+    **收益率完全不变** —— 所有价格同比例缩放，涨跌幅、盈亏比、回测结果一个都不动。
+    变的只有绝对价位，也就是"这些钱能买几手"和报告里打印的数字。
+    """
+    if factor <= 0:
+        raise ValueError("缩放系数必须为正")
+
+    bars = tuple(
+        Bar(
+            date=b.date,
+            open=b.open / factor,
+            high=b.high / factor,
+            low=b.low / factor,
+            close=b.close / factor,
+            volume=b.volume,
+            amount=b.amount / factor,  # 成交额同比例缩放，保持「均价 = 额/量」自洽
+            turnover=b.turnover,  # 换手率是无量纲的，不动
+        )
+        for b in series.bars
+    )
+    return series._replace(bars=bars)
+
+
+def get_backtest_series(
+    code: str,
+    start: date | None = None,
+    cache_dir: Path = DEFAULT_CACHE_DIR,
+    refresh: bool = False,
+) -> Series:
+    """拿一份可以直接用于回测的行情。**回测入口应该用这个，而不是 get_series。**
+
+    做两件事：
+
+    1. **用后复权**（fqt=2）。前复权对高分红股票会把价格算成 0 甚至负数，
+       实测工商银行 2014 年还有 "价格 0.04 元" —— 那种数据不是失真，是没有意义。
+
+    2. **整体缩放**，让回测起点的价格等于那天的**真实成交价**。
+       后复权的代价是绝对价位被放大（平安银行现在显示 1345 元，真实约 11 元），
+       而价位决定了"10 万本金能买几手"。整手取整和 5 元最低佣金都按成交金额
+       起作用，价位错了这两件事就全错。
+
+    缩放需要真实价格，所以要额外拉一次不复权数据（会走缓存，很便宜）。
+    拉不到就退回未缩放的序列 —— 收益率仍然正确，只是手数会失真。
+    """
+    adjusted = get_series(code, fqt=FQT_BACKWARD, cache_dir=cache_dir, refresh=refresh)
+
+    probe = start or adjusted.first_date
+    idx = adjusted.index_or_after(probe)
+    if idx is None:
+        return adjusted
+
+    try:
+        raw = get_series(code, fqt=FQT_NONE, cache_dir=cache_dir, refresh=refresh)
+    except DataError:
+        return adjusted
+
+    raw_idx = raw.index_of(adjusted.bars[idx].date)
+    if raw_idx is None:
+        return adjusted
+
+    real_price = raw.bars[raw_idx].close
+    if real_price <= 0:
+        return adjusted
+
+    factor = adjusted.bars[idx].close / real_price
+    if factor <= 0 or abs(factor - 1.0) < 1e-9:
+        return adjusted
+    return rescale(adjusted, factor)

@@ -27,6 +27,7 @@ class ChipPeak(Strategy):
         sell_above: float = 80.0,
         max_concentration: float = 0.40,
         decay: float = 1.0,
+        lookback: int = 500,
     ) -> None:
         """
         Args:
@@ -35,6 +36,12 @@ class ChipPeak(Strategy):
             sell_above: 获利盘高于这个百分比（%）时卖出
             max_concentration: 集中度上限，超过就不买（筹码太散）
             decay: 换手衰减系数，1.0 表示完全按真实换手率衰减
+            lookback: 只回看最近多少根 K 线（默认 500，约两年）
+
+                不设这个上限的话，分布会被迫覆盖股票几十年的全部价格区间，
+                网格被拉得很宽、每个格子很粗，近期的筹码反而分不清了。
+                而且几十年前的持仓早就换手换掉了（按 0.5% 日换手，
+                500 天前的筹码只剩 8%），本来就没必要算。
         """
         if not 0 < buy_below < sell_above < 100:
             raise ValueError(
@@ -43,12 +50,15 @@ class ChipPeak(Strategy):
             )
         if max_concentration <= 0:
             raise ValueError("max_concentration 必须为正数")
+        if lookback < 20:
+            raise ValueError("lookback 至少为 20，否则分布没有意义")
 
         self.bins = bins
         self.buy_below = buy_below
         self.sell_above = sell_above
         self.max_concentration = max_concentration
         self.decay = decay
+        self.lookback = lookback
 
         self._chips = ChipDistribution(bins, decay)
         self._last_index = -1
@@ -66,6 +76,7 @@ class ChipPeak(Strategy):
             "buy_below": self.buy_below,
             "sell_above": self.sell_above,
             "max_concentration": self.max_concentration,
+            "lookback": self.lookback,
         }
 
     def target(self, h: History) -> float:
@@ -96,7 +107,10 @@ class ChipPeak(Strategy):
             self._chips = ChipDistribution(self.bins, self.decay)
             self._last_index = -1
 
-        for j in range(self._last_index + 1, h.index + 1):
+        # 只回看 lookback 根 —— 更早的筹码早被换手换光了，算进来反而拖粗网格
+        first = max(self._last_index + 1, h.index - self.lookback + 1)
+
+        for j in range(first, h.index + 1):
             high = h.high[j]
             low = h.low[j]
             close = h.close[j]

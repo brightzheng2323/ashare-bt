@@ -19,11 +19,12 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Sequence
 
-from .cache import get_series
+from .cache import get_backtest_series, get_series
 from .engine import EngineConfig, run_backtest
 from .errors import DataError
-from .fetch import DEFAULT_FQT, FQT_LABEL
+from .fetch import DEFAULT_FQT, FQT_BACKWARD, FQT_LABEL
 from .fees import DEFAULT_FEES, FeeConfig
+from .models import Series
 from .metrics import buy_and_hold, format_report, summarize
 from .plot import plot_result
 from .strategies import build, describe_all
@@ -89,6 +90,19 @@ def _fee_config(args: argparse.Namespace) -> FeeConfig:
         stamp_duty_rate=args.stamp_duty,
         transfer_fee_rate=args.transfer_fee,
     )
+
+
+def _load_series(code: str, args: argparse.Namespace, start: date | None) -> Series:
+    """按命令行参数取行情。
+
+    默认走后复权 + 整体缩放（见 cache.get_backtest_series），
+    这样报告里的价格接近真实成交价，"能买几手"也算得对。
+    用户明确指定 --fqt 1/0 或 --no-rescale 时就不动它。
+    """
+    cache_dir = Path(args.cache_dir)
+    if args.fqt == FQT_BACKWARD and not args.no_rescale:
+        return get_backtest_series(code, start=start, cache_dir=cache_dir, refresh=args.refresh)
+    return get_series(code, fqt=args.fqt, cache_dir=cache_dir, refresh=args.refresh)
 
 
 def _write_csv(path: Path, header: Sequence[str], rows: Sequence[Sequence[Any]]) -> None:
@@ -208,6 +222,11 @@ def _backtest_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-benchmark", action="store_true", help="不拉沪深300做对比")
     parser.add_argument("--liquidate-at-end", action="store_true", help="结束时按收盘价强制平仓")
     parser.add_argument("--refresh", action="store_true", help="忽略缓存重新下载")
+    parser.add_argument(
+        "--no-rescale",
+        action="store_true",
+        help="不做价格缩放（默认会缩放到回测起点的真实价位，让手数和费用算得对）",
+    )
     parser.add_argument("--cache-dir", default="data/cache")
     parser.add_argument("--outdir", default="output")
     parser.add_argument("--no-plot", action="store_true", help="不画图")
@@ -231,7 +250,7 @@ def cmd_backtest(argv: Sequence[str]) -> int:
     cache_dir = Path(args.cache_dir)
 
     try:
-        series = get_series(args.code, fqt=args.fqt, refresh=args.refresh, cache_dir=cache_dir)
+        series = _load_series(args.code, args, start)
         benchmarks: dict[str, list[float]] = {}
 
         config = EngineConfig(
@@ -243,7 +262,7 @@ def cmd_backtest(argv: Sequence[str]) -> int:
         result = run_backtest(series, strategy, config=config, start=start, end=end)
 
         if not args.no_benchmark:
-            index_series = get_series(BENCHMARK_CODE, fqt=args.fqt, cache_dir=cache_dir)
+            index_series = _load_series(BENCHMARK_CODE, args, start)
             bench = buy_and_hold(index_series, result.dates, args.cash)
             if any(v != args.cash for v in bench):
                 benchmarks[BENCHMARK_NAME] = bench

@@ -12,7 +12,7 @@ from datetime import date
 from typing import Any
 
 from .fees import FeeConfig
-from .models import BacktestResult, Fill, RejectReason, Series, Side, Trade
+from .models import BacktestResult, Fill, RejectReason, Series, Trade
 
 TRADING_DAYS_PER_YEAR = 252
 """A 股一年大约 243 个交易日，惯例用 252 折算。绝不能用 365 —— 那是自然日。"""

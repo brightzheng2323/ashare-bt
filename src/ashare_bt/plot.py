@@ -24,7 +24,7 @@ import matplotlib.dates as mdates  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.ticker import FuncFormatter  # noqa: E402
 
-from .models import BacktestResult, RejectReason, Series, Side  # noqa: E402
+from .models import BacktestResult, Series, Side  # noqa: E402
 
 # ── 调色板（来自校验过的默认实例，不要随手改）────────────────────
 SURFACE = "#fcfcfb"
