@@ -42,14 +42,22 @@ class PortfolioResult:
     initial_cash: float = 0.0
     warnings: list[str] = field(default_factory=list)
 
-    def as_backtest_result(self, strategy_name: str) -> BacktestResult:
+    def as_backtest_result(self, strategy_name: str, label: str | None = None) -> BacktestResult:
         """合并成单个 BacktestResult，好复用现有的指标和报告。
 
         成交、交易、被拒订单直接拼在一起 —— 组合层面看这些是汇总量，
         想看某只股票的去 per_stock 里找。
+
+        Args:
+            label: 组合的简称，会出现在报告头和图表标题里。
+                不传的话，股票少就用代码拼起来，多了就只写只数 ——
+                300 个代码拼一行会直接把标题撑爆。
         """
+        if label is None:
+            label = "+".join(self.codes) if len(self.codes) <= 6 else f"{len(self.codes)} 只"
+
         combined = BacktestResult(
-            code="+".join(self.codes),
+            code=label,
             name=f"{len(self.codes)} 只股票组合",
             strategy_name=strategy_name,
             dates=list(self.dates),
@@ -231,6 +239,69 @@ def run_portfolio(
 
     _add_diagnostics(portfolio, config)
     return portfolio
+
+
+def equal_weight_buy_and_hold(
+    portfolio: PortfolioResult,
+    loader: Callable[[str], Series],
+) -> list[float]:
+    """组合的「等权买入持有」基准曲线。
+
+    **这是组合回测最该对比的基准。** 拿沪深300指数做基准其实偷换了概念 ——
+    指数是自由流通市值加权，而组合是等权；更重要的是，如果组合的股票是
+    "今天的成分股"挑出来的，指数里根本没有这个偏差。
+
+    实测：沪深300成分股等权买入持有 2020–2025 平均 +82.97%，
+    而同一批股票跑双均线只有 +32.25%。不看这条基准，就会把
+    "选股偏差的功劳"错记在策略头上。
+    """
+    curves: list[list[float]] = []
+    for code in portfolio.codes:
+        base = portfolio.initial_cash * portfolio.weights[code]
+        try:
+            series = loader(code)
+        except Exception:
+            continue  # 取不到就跳过，和 run_portfolio 的处理保持一致
+        curves.append(_buy_hold_curve(series, portfolio.dates, base))
+
+    if not curves:
+        return []
+
+    # 被跳过的股票那份钱没参与，补上让它保持现金
+    invested = sum(
+        portfolio.initial_cash * portfolio.weights[code] for code in portfolio.codes
+    )
+    idle_cash = max(portfolio.initial_cash - invested, 0.0)
+    return [
+        sum(curve[i] for curve in curves) + idle_cash for i in range(len(portfolio.dates))
+    ]
+
+
+def _first_close(series: Series, dates: Sequence[date]) -> float | None:
+    for d in dates:
+        idx = series.index_of(d)
+        if idx is not None:
+            return series.bars[idx].close
+    return None
+
+
+def _close_on(series: Series, d: date) -> float | None:
+    idx = series.index_of(d)
+    return None if idx is None else series.bars[idx].close
+
+
+def _buy_hold_curve(series: Series, dates: Sequence[date], base: float) -> list[float]:
+    first = _first_close(series, dates)
+    if not first:
+        return [base] * len(dates)
+    curve: list[float] = []
+    last = base
+    for d in dates:
+        close = _close_on(series, d)
+        if close is not None:
+            last = base * close / first
+        curve.append(last)
+    return curve
 
 
 def _add_diagnostics(portfolio: PortfolioResult, config: EngineConfig) -> None:

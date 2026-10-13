@@ -12,7 +12,11 @@ import datetime as dt
 import pytest
 
 from ashare_bt.engine import EngineConfig
-from ashare_bt.portfolio import normalize_weights, run_portfolio
+from ashare_bt.portfolio import (
+    equal_weight_buy_and_hold,
+    normalize_weights,
+    run_portfolio,
+)
 from conftest import build_series
 
 
@@ -230,8 +234,6 @@ class TestSkippedStocks:
             )
 
     def test_取数失败的股票也被跳过(self):
-        import datetime as _dt
-
         good = build_series([10.0 + i * 0.1 for i in range(40)], code="600519")
 
         def loader(code):
@@ -248,6 +250,97 @@ class TestSkippedStocks:
         )
         assert portfolio.codes == ["GOOD"]
         assert any("取不到行情" in w for w in portfolio.warnings)
+
+
+class TestEqualWeightBuyAndHold:
+    """组合回测最该对比的基准。只看「策略 vs 指数」会把选股偏差的功劳
+    错记在策略头上 —— 实测沪深300成分股等权买入持有 +82%，而同一批股票
+    跑双均线只有 +32%。"""
+
+    def _portfolio(self, stocks):
+        good = build_series([10.0 + i * 0.1 for i in range(40)], code="600519")
+        loader = _loader({code: good for code in stocks})
+        return run_portfolio(
+            list(stocks),
+            "ma_cross",
+            params={"fast": 3, "slow": 10},
+            config=EngineConfig(initial_cash=100_000.0),
+            loader=loader,
+        )
+
+    def test_横盘时等于本金(self):
+        flat = build_series([10.0] * 40, code="600519")
+        portfolio = run_portfolio(
+            ["A", "B"],
+            "ma_cross",
+            params={"fast": 3, "slow": 10},
+            config=EngineConfig(initial_cash=100_000.0),
+            loader=_loader({"A": flat, "B": flat}),
+        )
+        curve = equal_weight_buy_and_hold(portfolio, _loader({"A": flat, "B": flat}))
+        assert curve[-1] == pytest.approx(100_000.0)
+
+    def test_上涨时赚钱(self):
+        up = build_series([10.0 * (1.01**i) for i in range(40)], code="600519")
+        portfolio = run_portfolio(
+            ["A"],
+            "ma_cross",
+            params={"fast": 3, "slow": 10},
+            config=EngineConfig(initial_cash=100_000.0),
+            loader=_loader({"A": up}),
+        )
+        curve = equal_weight_buy_and_hold(portfolio, _loader({"A": up}))
+        assert curve[-1] > 100_000.0
+
+    def test_曲线长度与组合日期轴一致(self):
+        up = build_series([10.0 + i * 0.5 for i in range(40)], code="600519")
+        portfolio = run_portfolio(
+            ["A"],
+            "ma_cross",
+            params={"fast": 3, "slow": 10},
+            config=EngineConfig(initial_cash=100_000.0),
+            loader=_loader({"A": up}),
+        )
+        curve = equal_weight_buy_and_hold(portfolio, _loader({"A": up}))
+        assert len(curve) == len(portfolio.dates)
+
+    def test_取不到数据的股票被跳过(self):
+        up = build_series([10.0 + i * 0.5 for i in range(40)], code="600519")
+
+        def loader(code):
+            if code == "BROKEN":
+                raise RuntimeError("网络断了")
+            return up
+
+        portfolio = run_portfolio(
+            ["GOOD", "BROKEN"],
+            "ma_cross",
+            params={"fast": 3, "slow": 10},
+            config=EngineConfig(initial_cash=100_000.0),
+            loader=loader,
+        )
+        curve = equal_weight_buy_and_hold(portfolio, loader)
+        assert len(curve) == len(portfolio.dates)
+
+    def test_买入持有在单边上涨时应跑赢双均线(self):
+        """这是加了这条基准之后立刻能看出来的事。
+
+        一路上涨的行情里，任何趋势策略都会被来回止损磨掉一部分收益，
+        买入持有才是最优。如果这条测试红了，说明策略或基准有一个算错了。
+        """
+        up = build_series([10.0 * (1.008**i) for i in range(300)], code="600519")
+        loader = _loader({"A": up, "B": up})
+        portfolio = run_portfolio(
+            ["A", "B"],
+            "ma_cross",
+            params={"fast": 5, "slow": 20},
+            config=EngineConfig(initial_cash=200_000.0),
+            loader=loader,
+        )
+        hold = equal_weight_buy_and_hold(portfolio, loader)
+        strategy_return = portfolio.equity[-1] / portfolio.initial_cash - 1
+        hold_return = hold[-1] / portfolio.initial_cash - 1
+        assert hold_return > strategy_return
 
 
 class TestCombine:

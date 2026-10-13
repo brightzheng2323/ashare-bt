@@ -33,10 +33,18 @@ from .fetch import (
 )
 from .fees import DEFAULT_FEES, FeeConfig
 from .models import Series
-from .metrics import buy_and_hold, format_report, summarize
+from .metrics import (
+    annualized_return,
+    buy_and_hold,
+    format_report,
+    max_drawdown,
+    sharpe,
+    summarize,
+    total_return,
+)
 from .optimize import format_sweep, sweep
 from .plot import plot_result
-from .portfolio import run_portfolio
+from .portfolio import equal_weight_buy_and_hold, run_portfolio
 from .strategies import build, describe_all
 
 # 沪深300。必须写 "1." 前缀 —— 指数代码和个股代码会撞车，不带前缀会被当成深市个股
@@ -564,12 +572,14 @@ def cmd_portfolio(argv: Sequence[str]) -> int:
         return EXIT_USER_ERROR
 
     index_note: str | None = None
+    index_label: str | None = None
     try:
         if args.index:
             members = fetch_index_constituents(args.index, limit=args.limit)
             codes = [code for code, _ in members]
             key = index_secid(args.index)
             index_name = INDEX_BOARDS[key][1] if key in INDEX_BOARDS else args.index
+            index_label = f"{index_name}成分股"
             index_note = (
                 f"成分股用的是**今天**的{index_name}名单（{len(codes)} 只）。"
                 f"用它回测过去有**前视偏差** —— 今天还留在指数里的股票，本身就是这些年"
@@ -618,9 +628,25 @@ def cmd_portfolio(argv: Sequence[str]) -> int:
     if index_note:
         portfolio.warnings.insert(0, index_note)
 
-    combined = portfolio.as_backtest_result(args.strategy)
+    combined = portfolio.as_backtest_result(args.strategy, label=index_label)
     benchmarks: dict[str, list[float]] = {}
     if not args.no_benchmark:
+        # 最该对比的基准：同一批股票等权买入持有。
+        # 指数是市值加权，和等权组合不是一回事；更关键的是，如果成分股名单
+        # 本身带着"今天的幸存者"偏差，指数里根本没有这个偏差 ——
+        # 拿指数做基准会把选股偏差的功劳错记在策略头上。
+        try:
+            hold = equal_weight_buy_and_hold(
+                portfolio,
+                lambda code: get_backtest_series(
+                    code, start=start, cache_dir=cache_dir
+                ),
+            )
+            if hold and any(v != portfolio.initial_cash for v in hold):
+                benchmarks["等权买入持有"] = hold
+        except Exception as exc:
+            print(f"⚠️  算等权买入持有基准失败：{exc}", file=sys.stderr)
+
         try:
             index_series = get_backtest_series(BENCHMARK_CODE, start=start, cache_dir=cache_dir)
             curve = buy_and_hold(index_series, portfolio.dates, args.cash)
@@ -639,7 +665,7 @@ def cmd_portfolio(argv: Sequence[str]) -> int:
             - 1,
             "trade_count": len(portfolio.per_stock[code].trades),
         }
-        for code in codes
+        for code in portfolio.codes  # 只含跑成功的；被跳过的在 warnings 里
     }
 
     if args.json:
@@ -647,6 +673,25 @@ def cmd_portfolio(argv: Sequence[str]) -> int:
         return EXIT_OK
 
     print(format_report(stats))
+
+    if benchmarks:
+        # 把策略和各基准并排列出来。组合回测里这条对照最关键 ——
+        # 只看「策略 vs 指数」会把选股偏差的功劳错记在策略头上。
+        rows: list[tuple[str, list[float]]] = [(f"策略({args.strategy})", combined.equity)]
+        rows += list(benchmarks.items())
+        print("\n 对比")
+        for name, curve in rows:
+            if not curve:
+                continue
+            annual = annualized_return(curve)
+            annual_text = "     n/a" if annual is None else f"{annual:>+8.2%}"
+            sharpe_value = sharpe(curve)
+            sharpe_text = "   n/a" if sharpe_value is None else f"{sharpe_value:>6.2f}"
+            print(
+                f"   {name:<18} 累计 {total_return(curve):>+9.2%}   "
+                f"年化 {annual_text}   回撤 {max_drawdown(curve)[0]:>8.2%}   "
+                f"夏普 {sharpe_text}"
+            )
 
     components = []
     for code in portfolio.codes:  # 只含跑成功的，被跳过的在 warnings 里说了
