@@ -1,0 +1,35 @@
+[project]
+name = "ashare-bt"
+version = "0.1.0"
+description = "A股日线策略回测框架"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "requests>=2.32",
+    "matplotlib>=3.9",
+]
+
+[project.scripts]
+backtest = "ashare_bt.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8.3"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ashare_bt"]
+
+# 清华镜像。官方 pypi.org 在这台机器上要 15 秒以上，镜像 3 秒。
+# default = true 是关键，否则 uv 还是会先走官方源。
+[[tool.uv.index]]
+name = "tsinghua"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple/"
+default = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -m 'not network'"
+markers = ["network: 访问东方财富接口（默认跳过，用 -m network 显式运行）"]

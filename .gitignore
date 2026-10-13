@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.DS_Store
+
+# 数据缓存：可以重新下载，不进版本库
+data/cache/
+
+# 回测输出：图 + CSV 明细
+output/
