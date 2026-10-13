@@ -114,6 +114,118 @@ def fetch_series(
     )
 
 
+CONSTITUENTS_URL = "https://push2.eastmoney.com/api/qt/clist/get"
+
+CONSTITUENT_PAGE_SIZE = 100
+"""这个接口单页最多给 100 条，要 300 只就得分 3 页拉。"""
+
+INDEX_BOARDS: dict[str, tuple[str, str]] = {
+    # index secid -> (东财板块代码, 名字)
+    "1.000300": ("BK0500", "沪深300"),
+    "1.000016": ("BK0611", "上证50"),
+    "1.000905": ("BK0701", "中证500"),
+}
+"""指数代码 → 板块代码的映射。东财不认指数 secid，只认板块代码，
+实测 BK0500 返回恰好 300 只、BK0611 恰好 50 只、BK0701 恰好 500 只。"""
+
+
+def index_secid(code: str) -> str:
+    """把指数代码补全成 secid。
+
+    **指数和个股的编码规则不一样**，不能直接用 to_secid：
+        000300 → 个股规则会算成 0.000300（深市个股），实际是 1.000300（沪市指数）
+        000001 → 0.000001 是平安银行，1.000001 才是上证指数
+    指数的规则是：000xxx / 88xxxx / 93xxxx 在沪市，399xxx 在深市。
+    """
+    text = str(code).strip().upper()
+    if "." in text:
+        return text
+    bare = normalize_code(text)
+    if bare.startswith("399"):
+        return f"0.{bare}"
+    return f"1.{bare}"
+
+
+def fetch_index_constituents(
+    index: str = "1.000300",
+    limit: int | None = None,
+    timeout: float = 20.0,
+    retries: int = 3,
+) -> list[tuple[str, str]]:
+    """拉取指数成分股，返回 [(代码, 名称), ...]。
+
+    ⚠️ **拿到的是「今天」的成分股名单。** 用它回测历史会有**前视偏差**：
+    今天还留在沪深300里的股票，本身就是"过去这些年表现没掉队"的一批，
+    等于提前知道了答案。真实的成分股名单是每半年调整一次的，
+    要做严谨的历史回测需要逐个调仓日的名单，这个接口给不了。
+    """
+    key = index_secid(index)
+    if key not in INDEX_BOARDS:
+        known = "、".join(f"{v[1]}({k.split('.')[-1]})" for k, v in INDEX_BOARDS.items())
+        raise DataError(f"还不认识指数 {index!r}。目前支持：{known}")
+
+    board, _name = INDEX_BOARDS[key]
+    api = "https://push2.eastmoney.com/api/qt/clist/get"
+
+    members: list[tuple[str, str]] = []
+    page = 1
+    while True:
+        params = {
+            "pn": page,
+            "pz": CONSTITUENT_PAGE_SIZE,
+            "po": 1,
+            "np": 1,
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            "fltt": 2,
+            "invt": 2,
+            "fid": "f3",
+            "fs": f"b:{board}",
+            "fields": "f12,f14",
+        }
+        payload = None
+        last_error: Exception | None = None
+        for attempt in range(1, retries + 1):
+            try:
+                resp = requests.get(
+                    CONSTITUENTS_URL, params=params, headers=HEADERS, timeout=timeout
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+                break
+            except (requests.RequestException, ValueError) as exc:
+                last_error = exc
+                if attempt < retries:
+                    time.sleep(0.5 * attempt)
+
+        if payload is None:
+            raise DataError(f"拉取成分股失败（第 {page} 页）: {last_error}")
+
+        data = payload.get("data")
+        if not data or not data.get("diff"):
+            break
+
+        batch = [(row["f12"], row["f14"]) for row in data["diff"]]
+        members.extend(batch)
+
+        total = data.get("total", 0)
+        if len(members) >= total or not batch:
+            break
+        page += 1
+
+    if not members:
+        raise DataError(f"指数 {index} 没有拉到任何成分股")
+
+    # 去重但保序
+    seen: set[str] = set()
+    unique: list[tuple[str, str]] = []
+    for code, name in members:
+        if code not in seen:
+            seen.add(code)
+            unique.append((code, name))
+
+    return unique[:limit] if limit else unique
+
+
 def parse_klines(payload: dict, secid: str, fqt: int) -> Series:
     """把接口返回的 JSON 解析成 Series。"""
     data = payload.get("data")

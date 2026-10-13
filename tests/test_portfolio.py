@@ -169,6 +169,87 @@ class TestDiagnostics:
         assert any("最低佣金" in w for w in portfolio.warnings)
 
 
+class TestSkippedStocks:
+    """成分股里混进几只这段时间还没上市的次新股是常态。
+
+    实测跑沪深300时，第 92 只就是这种情况 —— 单只跑不起来不能让
+    整个 300 只的组合失败。
+    """
+
+    def _loader_for(self, good, late):
+        return _loader({"GOOD": good, "LATE": late})
+
+    def test_没有数据的股票被跳过而不是让组合失败(self):
+        good = build_series([10.0 + i * 0.1 for i in range(40)], code="600519")
+        late = build_series([20.0] * 5, code="600519", start=dt.date(2030, 1, 1))
+
+        portfolio = run_portfolio(
+            ["GOOD", "LATE"],
+            "ma_cross",
+            params={"fast": 3, "slow": 10},
+            config=EngineConfig(initial_cash=100_000.0),
+            start=dt.date(2024, 1, 1),
+            end=dt.date(2024, 12, 31),
+            loader=self._loader_for(good, late),
+        )
+
+        assert portfolio.codes == ["GOOD"]
+        assert any("跳过" in w for w in portfolio.warnings)
+        assert "LATE" in " ".join(portfolio.warnings)
+
+    def test_跳过的股票那份钱仍算作现金(self):
+        """漏掉这笔钱的话，组合本金会凭空少一块，收益率就失真了。"""
+        good = build_series([10.0 + i * 0.1 for i in range(40)], code="600519")
+        late = build_series([20.0] * 5, code="600519", start=dt.date(2030, 1, 1))
+
+        portfolio = run_portfolio(
+            ["GOOD", "LATE"],
+            "ma_cross",
+            params={"fast": 3, "slow": 10},
+            config=EngineConfig(initial_cash=100_000.0),
+            start=dt.date(2024, 1, 1),
+            end=dt.date(2024, 12, 31),
+            loader=self._loader_for(good, late),
+        )
+
+        assert portfolio.initial_cash == pytest.approx(100_000.0)
+        # 全都没开始交易之前，权益就等于本金
+        assert portfolio.equity[0] == pytest.approx(100_000.0)
+
+    def test_全部跑不起来时才报错(self):
+        late = build_series([20.0] * 5, code="600519", start=dt.date(2030, 1, 1))
+        with pytest.raises(ValueError, match="都没能跑起来"):
+            run_portfolio(
+                ["A", "B"],
+                "ma_cross",
+                params={"fast": 3, "slow": 10},
+                config=EngineConfig(initial_cash=100_000.0),
+                start=dt.date(2024, 1, 1),
+                end=dt.date(2024, 12, 31),
+                loader=_loader({"A": late, "B": late}),
+            )
+
+    def test_取数失败的股票也被跳过(self):
+        import datetime as _dt
+
+        good = build_series([10.0 + i * 0.1 for i in range(40)], code="600519")
+
+        def loader(code):
+            if code == "BROKEN":
+                raise RuntimeError("网络断了")
+            return good
+
+        portfolio = run_portfolio(
+            ["GOOD", "BROKEN"],
+            "ma_cross",
+            params={"fast": 3, "slow": 10},
+            config=EngineConfig(initial_cash=100_000.0),
+            loader=loader,
+        )
+        assert portfolio.codes == ["GOOD"]
+        assert any("取不到行情" in w for w in portfolio.warnings)
+
+
 class TestCombine:
     def test_合并结果能直接喂给指标模块(self):
         series = build_series([10.0 + i * 0.06 for i in range(50)])

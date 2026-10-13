@@ -142,10 +142,17 @@ def run_portfolio(
 
     per_stock: dict[str, BacktestResult] = {}
     series_by_code: dict[str, Series] = {}
+    skipped: list[tuple[str, str]] = []
 
     for code in codes:
-        series = loader(code)
-        series_by_code[code] = series
+        # 成分股里混进几只"这段区间还没上市"的次新股是常态（指数会纳入新上市的），
+        # 单只跑不起来不该让整个组合失败 —— 跳过它，把它那份钱留作现金。
+        try:
+            series = loader(code)
+        except Exception as exc:  # 取数失败也归到这一类
+            skipped.append((code, f"取不到行情：{exc}"))
+            continue
+
         sub_config = EngineConfig(
             initial_cash=config.initial_cash * allocation[code],
             fees=config.fees,
@@ -154,9 +161,21 @@ def run_portfolio(
             apply_new_listing_rule=config.apply_new_listing_rule,
             liquidate_at_end=config.liquidate_at_end,
         )
-        per_stock[code] = run_backtest(
-            series, build(strategy_name, **params), sub_config, start, end
-        )
+        try:
+            per_stock[code] = run_backtest(
+                series, build(strategy_name, **params), sub_config, start, end
+            )
+        except ValueError as exc:
+            skipped.append(
+                (code, f"{exc}（该股数据区间 {series.first_date} → {series.last_date}）")
+            )
+            continue
+
+        series_by_code[code] = series
+
+    if not per_stock:
+        detail = "; ".join(f"{c}: {why}" for c, why in skipped[:3])
+        raise ValueError(f"组合里所有股票都没能跑起来。{detail}")
 
     # 统一日期轴 = 所有子账户日期的并集
     all_dates = sorted({d for result in per_stock.values() for d in result.dates})
@@ -167,8 +186,7 @@ def run_portfolio(
     equity_curves: list[list[float]] = []
     cash_curves: list[list[float]] = []
     position_curves: list[list[float]] = []
-    for code in codes:
-        result = per_stock[code]
+    for code, result in per_stock.items():
         base = config.initial_cash * allocation[code]
         equity_curves.append(_align(result.dates, result.equity, all_dates, base))
         # 现金曲线在数据开始前也是 base（子账户拿着一笔还没用的现金）
@@ -177,14 +195,23 @@ def run_portfolio(
         position_curves.append(_align(result.dates, result.position_value, all_dates, 0.0))
         total += base
 
+    # 被跳过的股票：它那份钱全程是现金，一分没动。
+    # 必须算进总权益，否则组合本金就凭空少了一块，收益率会失真。
+    skipped_cash = sum(config.initial_cash * allocation[code] for code, _ in skipped)
+    if skipped_cash:
+        equity_curves.append([skipped_cash] * len(all_dates))
+        cash_curves.append([skipped_cash] * len(all_dates))
+        position_curves.append([0.0] * len(all_dates))
+        total += skipped_cash
+
     combined_equity = [sum(curve[i] for curve in equity_curves) for i in range(len(all_dates))]
     combined_cash = [sum(curve[i] for curve in cash_curves) for i in range(len(all_dates))]
     combined_position = [sum(curve[i] for curve in position_curves) for i in range(len(all_dates))]
 
     portfolio = PortfolioResult(
-        codes=list(codes),
-        names={code: series_by_code[code].name for code in codes},
-        weights=allocation,
+        codes=list(per_stock),
+        names={code: series_by_code[code].name for code in per_stock},
+        weights={code: allocation[code] for code in per_stock},
         dates=all_dates,
         equity=combined_equity,
         cash=combined_cash,
@@ -192,6 +219,15 @@ def run_portfolio(
         per_stock=per_stock,
         initial_cash=total,
     )
+
+    if skipped:
+        # 带上原因。全说成"没有数据"是错的 —— 取数失败和还没上市是两回事。
+        shown = "；".join(f"{code}: {why}" for code, why in skipped[:3])
+        more = f"；另有 {len(skipped) - 3} 只" if len(skipped) > 3 else ""
+        portfolio.warnings.append(
+            f"跳过 {len(skipped)} 只股票（{shown}{more}）。"
+            f"它们分到的资金全程留作现金，没有参与交易。"
+        )
 
     _add_diagnostics(portfolio, config)
     return portfolio
@@ -201,11 +237,27 @@ def _add_diagnostics(portfolio: PortfolioResult, config: EngineConfig) -> None:
     """把组合特有的坑提示出来。"""
     n = len(portfolio.codes)
 
-    # 先把子账户自己的警告带上来。不然会出现"某只股票贡献 0%、0 次交易"
-    # 而报告里一个字都不解释的情况 —— 最常见的原因就是分到的钱买不起一手。
+    # 把子账户的警告带上来。但**不能一条一条地堆** —— 300 只股票的组合同一条
+    # "买不起一手"能刷满整个屏幕。所以同类警告合并成一条。
+    unaffordable: list[str] = []
+    others: list[str] = []
     for code, result in portfolio.per_stock.items():
         for warning in result.warnings:
-            portfolio.warnings.append(f"[{portfolio.names[code]}] {warning}")
+            if "资金不足以买入一手" in warning:
+                unaffordable.append(portfolio.names.get(code, code))
+            else:
+                others.append(f"[{portfolio.names.get(code, code)}] {warning}")
+
+    if unaffordable:
+        shown = "、".join(unaffordable[:5])
+        more = f" 等 {len(unaffordable)} 只" if len(unaffordable) > 5 else ""
+        per_account = config.initial_cash / n
+        portfolio.warnings.append(
+            f"有 {len(unaffordable)} 只股票因为分到的资金买不起一手而全程没有交易"
+            f"（{shown}{more}）。组合本金 {config.initial_cash:,.0f} 元均分到 {n} 只，"
+            f"每只只有 {per_account:,.0f} 元。请提高 --cash，或用 --limit 减少股票数量。"
+        )
+    portfolio.warnings.extend(others)
 
     # 有效交易日数量差距很大 → 说明有些股票大部分时间根本不在场
     counts = {code: len(r.dates) for code, r in portfolio.per_stock.items()}

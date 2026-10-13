@@ -23,7 +23,14 @@ from .cache import get_backtest_series, get_series
 from .engine import EngineConfig, run_backtest
 from .errors import DataError
 from .explore import explore
-from .fetch import DEFAULT_FQT, FQT_BACKWARD, FQT_LABEL
+from .fetch import (
+    DEFAULT_FQT,
+    FQT_BACKWARD,
+    FQT_LABEL,
+    INDEX_BOARDS,
+    fetch_index_constituents,
+    index_secid,
+)
 from .fees import DEFAULT_FEES, FeeConfig
 from .models import Series
 from .metrics import buy_and_hold, format_report, summarize
@@ -93,6 +100,28 @@ def _fee_config(args: argparse.Namespace) -> FeeConfig:
         stamp_duty_rate=args.stamp_duty,
         transfer_fee_rate=args.transfer_fee,
     )
+
+
+def _progress_loader(load: Any, total: int, quiet: bool) -> Any:
+    """给 loader 套一层进度显示。
+
+    拉 300 只股票要联网 600 次（每只还要拉一遍不复权数据用来做价格缩放），
+    没有进度条的话看起来就像卡死了。
+    """
+    if quiet or total < 5:
+        return load
+
+    counter = {"n": 0}
+
+    def wrapped(code: str):
+        counter["n"] += 1
+        print(f"\r  拉取行情 {counter['n']}/{total} ...", end="", file=sys.stderr)
+        result = load(code)
+        if counter["n"] == total:
+            print("\r" + " " * 40 + "\r", end="", file=sys.stderr)
+        return result
+
+    return wrapped
 
 
 def _load_series(code: str, args: argparse.Namespace, start: date | None) -> Series:
@@ -497,7 +526,12 @@ def cmd_portfolio(argv: Sequence[str]) -> int:
             "  backtest portfolio --codes 000001,600519 --weights 0.7,0.3\n"
         ),
     )
-    parser.add_argument("--codes", required=True, help="逗号分隔的股票代码")
+    parser.add_argument("--codes", help="逗号分隔的股票代码，如 000001,600519")
+    parser.add_argument(
+        "--index",
+        help="用指数成分股，如 000300 / 000016 / 000905（会带前视偏差，见报告里的警告）",
+    )
+    parser.add_argument("--limit", type=int, help="只取前 N 只成分股，用来先跑个小的")
     parser.add_argument("--weights", help="逗号分隔的权重，默认等权")
     parser.add_argument("--strategy", "-s", default="ma_cross")
     parser.add_argument("--start")
@@ -518,11 +552,36 @@ def cmd_portfolio(argv: Sequence[str]) -> int:
     parser.add_argument("--json", action="store_true")
     args, extra = parser.parse_known_args(list(argv))
 
-    codes = _codes(args.codes)
+    if bool(args.codes) == bool(args.index):
+        print("❌ --codes 和 --index 必须给且只能给一个", file=sys.stderr)
+        return EXIT_USER_ERROR
+
     try:
         params = _extra_params(extra)
         build(args.strategy, **params)  # 提前校验参数名，别等跑完才发现拼错
     except ValueError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return EXIT_USER_ERROR
+
+    index_note: str | None = None
+    try:
+        if args.index:
+            members = fetch_index_constituents(args.index, limit=args.limit)
+            codes = [code for code, _ in members]
+            key = index_secid(args.index)
+            index_name = INDEX_BOARDS[key][1] if key in INDEX_BOARDS else args.index
+            index_note = (
+                f"成分股用的是**今天**的{index_name}名单（{len(codes)} 只）。"
+                f"用它回测过去有**前视偏差** —— 今天还留在指数里的股票，本身就是这些年"
+                f"表现没掉队的一批，等于提前知道了答案。真实的成分股每半年调整一次，"
+                f"严谨的历史回测需要逐个调仓日的名单，本工具拿不到。"
+                f"所以下面的收益数字应当**偏乐观**看待。"
+            )
+            if args.limit:
+                index_note += f" （另外你用了 --limit {args.limit}，只取了名单前 {len(codes)} 只。）"
+        else:
+            codes = _codes(args.codes)
+    except DataError as exc:
         print(f"❌ {exc}", file=sys.stderr)
         return EXIT_USER_ERROR
 
@@ -544,13 +603,20 @@ def cmd_portfolio(argv: Sequence[str]) -> int:
             start=start,
             end=end,
             weights=weights,
-            loader=lambda code: get_backtest_series(
-                code, start=start, cache_dir=cache_dir, refresh=args.refresh
+            loader=_progress_loader(
+                lambda code: get_backtest_series(
+                    code, start=start, cache_dir=cache_dir, refresh=args.refresh
+                ),
+                total=len(codes),
+                quiet=args.json,
             ),
         )
     except (DataError, ValueError) as exc:
         print(f"❌ {exc}", file=sys.stderr)
         return EXIT_USER_ERROR
+
+    if index_note:
+        portfolio.warnings.insert(0, index_note)
 
     combined = portfolio.as_backtest_result(args.strategy)
     benchmarks: dict[str, list[float]] = {}
@@ -582,15 +648,45 @@ def cmd_portfolio(argv: Sequence[str]) -> int:
 
     print(format_report(stats))
 
-    print("\n 各成分股（按分配到的资金单独结算）")
-    for code in codes:
+    components = []
+    for code in portfolio.codes:  # 只含跑成功的，被跳过的在 warnings 里说了
         sub = portfolio.per_stock[code]
         base = portfolio.initial_cash * portfolio.weights[code]
-        ret = sub.equity[-1] / base - 1 if base else 0.0
-        print(
-            f"   {code} {portfolio.names[code]:<8} 权重 {portfolio.weights[code]:>5.1%}  "
-            f"分配 {base:>10,.0f}  收益 {ret:>+8.2%}  交易 {len(sub.trades):>3} 次"
+        components.append(
+            (code, sub.equity[-1] / base - 1 if base else 0.0, len(sub.trades), base)
         )
+    traded = [c for c in components if c[2] > 0]
+    idle = [c for c in components if c[2] == 0]
+
+    def _line(item) -> str:
+        code, ret, trades, base = item
+        return (
+            f"   {code} {portfolio.names[code]:<9} 分配 {base:>10,.0f}  "
+            f"收益 {ret:>+9.2%}  交易 {trades:>3} 次"
+        )
+
+    print(f"\n 成分股表现（{len(components)} 只中 {len(traded)} 只有交易，{len(idle)} 只全程闲置）")
+    if len(components) <= 20:
+        for item in components:
+            print(_line(item))
+    else:
+        by_return = sorted(traded, key=lambda c: c[1], reverse=True)
+        print("  最好 5 只：")
+        for item in by_return[:5]:
+            print(_line(item))
+        print("  最差 5 只：")
+        for item in by_return[-5:]:
+            print(_line(item))
+        if idle:
+            print(f"  （另有 {len(idle)} 只因为分到的资金买不起一手而全程闲置，不参与比较）")
+        if traded:
+            returns = [c[1] for c in traded]
+            wins = sum(1 for r in returns if r > 0)
+            print(
+                f"\n  个股收益：中位数 {sorted(returns)[len(returns) // 2]:+.2%}   "
+                f"平均 {sum(returns) / len(returns):+.2%}   "
+                f"为正的 {wins}/{len(traded)} 只（{wins / len(traded):.0%}）"
+            )
 
     stem = f"portfolio_{len(codes)}只_{args.strategy}"
     outdir = Path(args.outdir)
